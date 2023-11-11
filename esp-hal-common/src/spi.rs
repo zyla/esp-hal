@@ -2587,8 +2587,40 @@ pub trait Instance {
     /// you must ensure that the whole messages was written correctly, use
     /// [`Self::flush`].
     // FIXME: See below.
-    fn write_bytes(&mut self, words: &[u8]) -> Result<(), Error> {
+    fn write_bytes(&mut self, orig_words: &[u8]) -> Result<(), Error> {
+        let misalign = (4 - orig_words.as_ptr() as usize % 4) % 4;
+
         let reg_block = self.register_block();
+        let fifo_ptr = reg_block.w0.as_ptr();
+
+        let first_transfer_len = core::cmp::min(orig_words.len(), misalign);
+        if first_transfer_len > 0 {
+            self.configure_datalen(first_transfer_len as u32 * 8);
+            let word = match first_transfer_len {
+                1 => orig_words[0] as u32,
+                2 => orig_words[0] as u32 | (orig_words[1] as u32) << 8,
+                3 => {
+                    orig_words[0] as u32
+                        | (orig_words[1] as u32) << 8
+                        | (orig_words[2] as u32) << 16
+                }
+                _ => panic!(),
+            };
+            unsafe {
+                fifo_ptr.write(word);
+            }
+
+            self.update();
+
+            reg_block.cmd.modify(|_, w| w.usr().set_bit());
+        }
+
+        if orig_words.len() <= misalign {
+            return Ok(());
+        }
+
+        let words = &orig_words[misalign..];
+
         let num_chunks = words.len() / FIFO_SIZE;
 
         // The fifo has a limited fixed size, so the data must be chunked and then
@@ -2596,34 +2628,22 @@ pub trait Instance {
         for (i, chunk) in words.chunks(FIFO_SIZE).enumerate() {
             self.configure_datalen(chunk.len() as u32 * 8);
 
-            let fifo_ptr = reg_block.w0.as_ptr();
-            for i in (0..chunk.len()).step_by(4) {
-                let state = if chunk.len() - i < 4 {
-                    chunk.len() % 4
-                } else {
-                    0
-                };
-                let word = match state {
-                    0 => {
-                        (chunk[i] as u32)
-                            | (chunk[i + 1] as u32) << 8
-                            | (chunk[i + 2] as u32) << 16
-                            | (chunk[i + 3] as u32) << 24
-                    }
-
-                    3 => {
-                        (chunk[i] as u32) | (chunk[i + 1] as u32) << 8 | (chunk[i + 2] as u32) << 16
-                    }
-
-                    2 => (chunk[i] as u32) | (chunk[i + 1] as u32) << 8,
-
-                    1 => chunk[i] as u32,
-
-                    _ => panic!(),
-                };
+            for i in 0..chunk.len() / 4 {
                 unsafe {
-                    fifo_ptr.add(i / 4).write_volatile(word);
+                    let word = *(chunk.as_ptr() as *const u32).add(i);
+                    fifo_ptr.add(i).write_volatile(word);
                 }
+            }
+            let last = &chunk[chunk.len() / 4 * 4..];
+            let last_ptr = unsafe { fifo_ptr.add(chunk.len() / 4) };
+            match last.len() {
+                0 => {}
+                1 => unsafe { last_ptr.write(last[0] as u32) },
+                2 => unsafe { last_ptr.write(last[0] as u32 | (last[1] as u32) << 8) },
+                3 => unsafe {
+                    last_ptr.write(last[0] as u32 | (last[1] as u32) << 8 | (last[2] as u32) << 16)
+                },
+                _ => panic!(),
             }
 
             self.update();
