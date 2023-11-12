@@ -1299,7 +1299,12 @@ pub mod dma {
 
         fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
             Ok(
-                if !crate::soc::is_valid_ram_address(&words[0] as *const _ as u32) {
+                if !crate::soc::is_valid_ram_address(&words[0] as *const _ as u32)
+                // Handle also small transfers through the internal buffer.
+                // Otherwise they seem to hang (e.g. when size=2). Why? Probably alignment or
+                // something
+                    || words.len() < 4
+                {
                     for chunk in words.chunks(SIZE) {
                         self.buffer[..chunk.len()].copy_from_slice(chunk);
                         self.inner.write(&self.buffer[..chunk.len()])?;
